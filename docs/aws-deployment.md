@@ -81,7 +81,7 @@ The frontend talks to the backend over the public internet (browser → `api.mik
 | `mike-frontend` | 0.25 | 512 MB | Next.js standalone is light. |
 | `mike-backend` | 0.5 | 2048 MB | Uploads up to 100 MB are buffered in memory (`multer.memoryStorage()`), and LibreOffice spawns to convert DOC/DOCX. 1 GB is the floor; 2 GB gives headroom for concurrent uploads + a LibreOffice subprocess. |
 
-Run **2 tasks per service** minimum so a single-AZ outage or task replacement doesn't blip you offline.
+Run **2 tasks per service** minimum so a task replacement or container failure doesn't blip you offline. Note: 2 tasks protect against task-level failures only — this guide uses a single-AZ RDS instance and a single NAT gateway, so a full AZ failure can still affect database connectivity or outbound AWS API access. See [Appendix A](#appendix-a--optional-improvements) (Multi-AZ RDS) to harden against AZ-level outages.
 
 ---
 
@@ -137,7 +137,7 @@ aws ec2 create-vpc \
   --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT}-${ENV}-vpc}]"
 # Note the VpcId returned; export it as VPC_ID.
 
-aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames '{"Value":true}'
 ```
 
 Create two public and two private subnets across two AZs:
@@ -226,18 +226,37 @@ Create four SGs:
 | `mike-prod-rds-sg` | 5432 from `tasks-sg` | none |
 
 ```bash
-# Tasks SG
-aws ec2 create-security-group --group-name ${PROJECT}-${ENV}-tasks-sg \
-  --description "ECS tasks" --vpc-id $VPC_ID
+# Frontend ALB SG
+ALB_FRONTEND_SG=$(aws ec2 create-security-group \
+  --group-name ${PROJECT}-${ENV}-alb-frontend-sg \
+  --description "Frontend ALB" --vpc-id $VPC_ID \
+  --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $ALB_FRONTEND_SG --protocol tcp --port 443 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $ALB_FRONTEND_SG --protocol tcp --port 80  --cidr 0.0.0.0/0
 
+# Backend ALB SG
+ALB_BACKEND_SG=$(aws ec2 create-security-group \
+  --group-name ${PROJECT}-${ENV}-alb-backend-sg \
+  --description "Backend ALB" --vpc-id $VPC_ID \
+  --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $ALB_BACKEND_SG --protocol tcp --port 443 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $ALB_BACKEND_SG --protocol tcp --port 80  --cidr 0.0.0.0/0
+
+# Tasks SG
+TASKS_SG=$(aws ec2 create-security-group \
+  --group-name ${PROJECT}-${ENV}-tasks-sg \
+  --description "ECS tasks" --vpc-id $VPC_ID \
+  --query GroupId --output text)
 aws ec2 authorize-security-group-ingress --group-id $TASKS_SG \
   --protocol tcp --port 3000 --source-group $ALB_FRONTEND_SG
 aws ec2 authorize-security-group-ingress --group-id $TASKS_SG \
   --protocol tcp --port 3001 --source-group $ALB_BACKEND_SG
 
 # RDS SG
-aws ec2 create-security-group --group-name ${PROJECT}-${ENV}-rds-sg \
-  --description "RDS Postgres" --vpc-id $VPC_ID
+RDS_SG=$(aws ec2 create-security-group \
+  --group-name ${PROJECT}-${ENV}-rds-sg \
+  --description "RDS Postgres" --vpc-id $VPC_ID \
+  --query GroupId --output text)
 aws ec2 authorize-security-group-ingress --group-id $RDS_SG \
   --protocol tcp --port 5432 --source-group $TASKS_SG
 ```
@@ -364,7 +383,10 @@ When it reaches `available`, grab the endpoint:
 ```bash
 DB_HOST=$(aws rds describe-db-instances --db-instance-identifier ${PROJECT}-${ENV} \
   --query 'DBInstances[0].Endpoint.Address' --output text)
-DATABASE_URL="postgres://mike:${DB_MASTER_PASSWORD}@${DB_HOST}:5432/mike?sslmode=require"
+# URL-encode the password so reserved characters (#, ?, %, &, :, @, etc.) don't
+# break the connection string parser.
+DB_MASTER_PASSWORD_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$DB_MASTER_PASSWORD")
+DATABASE_URL="postgres://mike:${DB_MASTER_PASSWORD_ENCODED}@${DB_HOST}:5432/mike?sslmode=require"
 ```
 
 Sizing guidance:
@@ -506,7 +528,7 @@ Required secrets:
 | Secret name | Contents | Notes |
 |---|---|---|
 | `mike/prod/database-url` | `postgres://mike:…@…:5432/mike?sslmode=require` | Plaintext string. |
-| `mike/prod/download-signing-secret` | 32-byte hex | Backend signs S3 redirect URLs. `openssl rand -hex 32`. |
+| `mike/prod/download-signing-secret` | 32-byte hex | HMAC key for persistent `/download/:token` links stored in chat history (`backend/src/lib/downloadTokens.ts`). `openssl rand -hex 32`. |
 | `mike/prod/user-api-keys-encryption-secret` | long random string | AES-256-GCM key for per-user provider keys stored in Postgres. `openssl rand -base64 48`. |
 | `mike/prod/gemini-api-key` *(optional)* | Google AI Studio key | Only if you want a server-wide Gemini key. Users can still bring their own. |
 | `mike/prod/openai-api-key` *(optional)* | OpenAI key | Same caveat. |
@@ -522,7 +544,7 @@ aws secretsmanager create-secret --name mike/prod/user-api-keys-encryption-secre
   --secret-string "$(openssl rand -base64 48)"
 ```
 
-**Do not rotate `user-api-keys-encryption-secret` without a re-encryption migration.** Anything encrypted with it (user-stored OpenAI/Gemini keys) becomes unreadable. Treat it as a long-lived secret. The download signing secret can be rotated freely; outstanding signed URLs become invalid (typically <1 hour TTL).
+**Do not rotate `user-api-keys-encryption-secret` without a re-encryption migration.** Anything encrypted with it (user-stored OpenAI/Gemini keys) becomes unreadable. Treat it as a long-lived secret. **Do not rotate `download-signing-secret` without a compatibility window** — it signs persistent, non-expiring download tokens stored in chat history. Rotating it immediately breaks every existing `/download/:token` link. If you must rotate, run a backfill that re-signs all stored paths before cutting over.
 
 ---
 
@@ -730,10 +752,11 @@ Alias records pointing at each ALB:
 # Get the ALBs' canonical hosted zone ids
 aws elbv2 describe-load-balancers --load-balancer-arns $FRONTEND_ALB_ARN \
   --query 'LoadBalancers[0].[DNSName,CanonicalHostedZoneId]' --output text
-# Use the values to create A/AAAA alias records in Route 53.
+# Use the DNS name and canonical hosted zone id to create A alias records in Route 53.
+# (ALBs are IPv4-only with --ip-address-type ipv4; create A records, not AAAA.)
 ```
 
-In the console: Route 53 → Hosted zones → `${DOMAIN}` → Create record → `app` → A → Alias to ALB → pick the frontend ALB. Repeat for `api` → backend ALB.
+In the console: Route 53 → Hosted zones → `${DOMAIN}` → Create record → `app` → A → Alias to ALB → pick the frontend ALB. Repeat for `api` → backend ALB. If you need IPv6, recreate the ALBs with `--ip-address-type dualstack` and add AAAA alias records in addition to A.
 
 ---
 
@@ -770,7 +793,7 @@ cat > /tmp/td-backend.json <<EOF
       { "name": "S3_BUCKET_NAME", "value": "${BUCKET}" },
       { "name": "COGNITO_USER_POOL_ID", "value": "${COGNITO_USER_POOL_ID}" },
       { "name": "COGNITO_CLIENT_ID", "value": "${COGNITO_CLIENT_ID}" },
-      { "name": "TRUST_PROXY_HOPS", "value": "2" }
+      { "name": "TRUST_PROXY_HOPS", "value": "1" }
     ],
     "secrets": [
       { "name": "DATABASE_URL",                    "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:mike/prod/database-url" },
@@ -793,7 +816,7 @@ aws ecs register-task-definition --cli-input-json file:///tmp/td-backend.json
 
 Key choices:
 
-- **`TRUST_PROXY_HOPS=2`** — request goes browser → ALB → task. Express needs to skip two proxy hops to recover the client IP for rate limiting. The default in code is `1`, which is wrong behind ALB; setting it explicitly avoids the gotcha.
+- **`TRUST_PROXY_HOPS=1`** — there is one trusted proxy (the ALB). Express `trust proxy = 1` means "trust the immediate upstream; take the client IP from the rightmost XFF entry added by that proxy." Setting it to `2` would cause Express to look further left in the `X-Forwarded-For` chain, where an attacker can inject arbitrary IPs, defeating the rate limiter. The code default is already `1`; setting it here makes it explicit and guards against env misconfiguration.
 - **No `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`** — the task role provides credentials transparently. Set these only for local dev with MinIO. Leave `S3_ENDPOINT_URL` unset too, so the SDK uses the real S3.
 - **No `COGNITO_JWKS_URI` or `COGNITO_ENDPOINT`** — the SDK resolves these from the pool id automatically. Setting them forces the local-dev path.
 - **`GEMINI_API_KEY` / `OPENAI_API_KEY`** — add to `secrets` only if you stored them in Secrets Manager. Leaving them unset is fine; users can supply their own keys in the UI.
@@ -846,10 +869,39 @@ aws ecs register-task-definition --cli-input-json file:///tmp/td-frontend.json
 
 **Critical Next.js gotcha:** `NEXT_PUBLIC_*` env vars are baked into the JS bundle at **build time**. The image in `ghcr.io/${GHCR_OWNER}/mike-frontend` is built without your prod values. There are two options:
 
-1. **Build your own image** that injects your prod `NEXT_PUBLIC_*` values during `next build`. This is what production-grade deployments do. Either fork the repo and tweak the build workflow, or add an `args:` block to a Buildx invocation that re-builds against the same source.
-2. **Accept the defaults baked in by the upstream build** — fine for an internal demo, broken for prod because the bundle will be hardcoded to `http://localhost:3001` for the API.
+1. **Build your own image** that injects your prod `NEXT_PUBLIC_*` values during `next build`. You must make two changes:
 
-If you go with (1), publish to your own ECR or a private GHCR namespace and replace the `image:` value in the task definition. See [Appendix A](#appendix-a--optional-improvements) for the GitHub Actions changes.
+   **`frontend/Dockerfile`** — add `ARG` declarations before `npm run build` so the build stage can receive them:
+   ```dockerfile
+   FROM node:20-alpine AS build
+   WORKDIR /app
+   COPY --from=deps /app/node_modules ./node_modules
+   COPY . .
+   # Declare build args so next build can bake them into the bundle.
+   ARG NEXT_PUBLIC_API_BASE_URL
+   ARG NEXT_PUBLIC_AWS_REGION
+   ARG NEXT_PUBLIC_COGNITO_USER_POOL_ID
+   ARG NEXT_PUBLIC_COGNITO_CLIENT_ID
+   ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL \
+       NEXT_PUBLIC_AWS_REGION=$NEXT_PUBLIC_AWS_REGION \
+       NEXT_PUBLIC_COGNITO_USER_POOL_ID=$NEXT_PUBLIC_COGNITO_USER_POOL_ID \
+       NEXT_PUBLIC_COGNITO_CLIENT_ID=$NEXT_PUBLIC_COGNITO_CLIENT_ID
+   ENV NEXT_TELEMETRY_DISABLED=1
+   RUN npm run build
+   ```
+
+   **GitHub Actions** (or your local build command) — pass `build-args:` when invoking Buildx:
+   ```yaml
+   build-args: |
+     NEXT_PUBLIC_API_BASE_URL=https://api.mikeoss.com
+     NEXT_PUBLIC_AWS_REGION=us-east-1
+     NEXT_PUBLIC_COGNITO_USER_POOL_ID=${{ secrets.COGNITO_USER_POOL_ID }}
+     NEXT_PUBLIC_COGNITO_CLIENT_ID=${{ secrets.COGNITO_CLIENT_ID }}
+   ```
+
+   Publish to your own ECR or private GHCR namespace and replace the `image:` value in the task definition.
+
+2. **Accept the defaults baked in by the upstream build** — fine for an internal demo, broken for prod because the bundle will be hardcoded to `http://localhost:3001` for the API.
 
 ### Services
 
@@ -912,7 +964,7 @@ aws application-autoscaling put-scaling-policy \
 
 ## 15. Database migrations
 
-Drizzle migrations live under `backend/drizzle/`. The backend image bundles them and exposes `npm run db:migrate` (which runs `tsx src/db/migrate.ts` against `DATABASE_URL`).
+Drizzle migrations live under `backend/drizzle/`. The published `mike-backend` image includes the compiled migration entrypoint at `dist/db/migrate.js` (built by `tsc` in the Dockerfile) and the `drizzle/` SQL migration files. The production runtime only ships production `node_modules` (no `tsx`), so you must invoke the **compiled** entrypoint directly:
 
 Run as a **one-shot ECS run-task** invocation that overrides the container command:
 
@@ -925,7 +977,7 @@ aws ecs run-task \
   --overrides '{
     "containerOverrides": [{
       "name": "backend",
-      "command": ["npm", "run", "db:migrate"]
+      "command": ["node", "dist/db/migrate.js"]
     }]
   }'
 ```
@@ -1118,7 +1170,7 @@ Pre-launch:
 - [ ] Cognito password policy is at least 10 chars with mixed case + digits (set in §5b).
 - [ ] Cognito `prevent-user-existence-errors` is `ENABLED` (set in §5b — defends against user enumeration).
 - [ ] ALB listeners use `ELBSecurityPolicy-TLS13-1-2-2021-06` or stricter.
-- [ ] HSTS is on (the backend sets it via `helmet` when `NODE_ENV=production`).
+- [ ] HSTS is on for the **backend** hostname — `helmet` sets it when `NODE_ENV=production`. The **frontend** (Next.js standalone, `${APP_FQDN}`) does not go through Express, so HSTS for `app.${DOMAIN}` must be set separately: either via an [ALB response header policy](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/response-header-policies.html) attached to the frontend listener, or via a `Strict-Transport-Security` header in `next.config.ts` (`headers()` config).
 - [ ] CloudTrail is enabled in the account (not covered here — assume baseline org-level config).
 
 After launch:
@@ -1173,7 +1225,7 @@ After launch:
 
 **Rate limiter blocks every request from one IP.**
 
-- `TRUST_PROXY_HOPS` is wrong. Behind ALB → ECS task it should be `2`. If it's `0`, every request appears to come from the ALB's internal IP, exhausting the limiter for that IP for the whole window.
+- `TRUST_PROXY_HOPS` is wrong. Behind a single ALB → ECS task it should be `1`. If it's `0`, every request appears to come from the ALB's internal IP, exhausting the limiter for that IP for the whole window.
 
 ---
 
@@ -1181,7 +1233,7 @@ After launch:
 
 These aren't required to ship, but most prod deployments end up here within a few months:
 
-**Re-build frontend image with prod `NEXT_PUBLIC_*` values.** Fork the build workflow, add `build-args:` for each `NEXT_PUBLIC_*`, and publish to your own namespace (or ECR). Without this, the frontend bundle is hardcoded to the upstream default values.
+**Re-build frontend image with prod `NEXT_PUBLIC_*` values.** Two changes are required (see the full diff in §14): (1) add `ARG`/`ENV` declarations for each `NEXT_PUBLIC_*` variable in `frontend/Dockerfile` before the `RUN npm run build` step — without these, `build-args` passed by Buildx are silently ignored and the defaults remain baked in; (2) pass the prod values via `build-args:` in your build workflow. Publish to your own ECR or private GHCR namespace and update the `image:` field in the task definition.
 
 **Mirror images to ECR.** Better pull latency, IAM-native auth (no Secrets Manager indirection), and lifecycle policies for tag cleanup. Add a job to `build-and-publish.yml` that re-tags the ghcr.io image into `${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/mike-{frontend,backend}` after the existing push.
 
