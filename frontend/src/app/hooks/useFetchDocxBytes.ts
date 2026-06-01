@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/auth/cognito";
+import { apiBaseUrl } from "@/lib/runtimeConfig";
 
 export interface FetchDocxResult {
   bytes: ArrayBuffer | null;
@@ -34,7 +35,7 @@ export function useFetchDocxBytes(
   refetchKey?: number,
 ): FetchDocxResult {
   const key = documentId ? cacheKey(documentId, versionId, refetchKey) : null;
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
+  const apiBase = apiBaseUrl();
   const qs = versionId ? `?version_id=${encodeURIComponent(versionId)}` : "";
   const url = documentId ? `${apiBase}/single-documents/${documentId}/docx${qs}` : null;
   const cached = key ? (bytesCache.get(key) ?? null) : null;

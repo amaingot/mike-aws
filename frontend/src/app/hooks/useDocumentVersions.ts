@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/auth/cognito";
+import { apiBaseUrl } from "@/lib/runtimeConfig";
 
 export interface DocumentVersionRow {
   id: string;
@@ -49,7 +50,7 @@ export function useDocumentVersions(
           data: { session },
         } = await supabase.auth.getSession();
         const token = session?.access_token;
-        const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
+        const apiBase = apiBaseUrl();
         const resp = await fetch(`${apiBase}/single-documents/${documentId}/versions`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
