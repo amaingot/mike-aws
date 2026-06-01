@@ -867,41 +867,16 @@ EOF
 aws ecs register-task-definition --cli-input-json file:///tmp/td-frontend.json
 ```
 
-**Critical Next.js gotcha:** `NEXT_PUBLIC_*` env vars are baked into the JS bundle at **build time**. The image in `ghcr.io/${GHCR_OWNER}/mike-frontend` is built without your prod values. There are two options:
-
-1. **Build your own image** that injects your prod `NEXT_PUBLIC_*` values during `next build`. You must make two changes:
-
-   **`frontend/Dockerfile`** — add `ARG` declarations before `npm run build` so the build stage can receive them:
-   ```dockerfile
-   FROM node:20-alpine AS build
-   WORKDIR /app
-   COPY --from=deps /app/node_modules ./node_modules
-   COPY . .
-   # Declare build args so next build can bake them into the bundle.
-   ARG NEXT_PUBLIC_API_BASE_URL
-   ARG NEXT_PUBLIC_AWS_REGION
-   ARG NEXT_PUBLIC_COGNITO_USER_POOL_ID
-   ARG NEXT_PUBLIC_COGNITO_CLIENT_ID
-   ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL \
-       NEXT_PUBLIC_AWS_REGION=$NEXT_PUBLIC_AWS_REGION \
-       NEXT_PUBLIC_COGNITO_USER_POOL_ID=$NEXT_PUBLIC_COGNITO_USER_POOL_ID \
-       NEXT_PUBLIC_COGNITO_CLIENT_ID=$NEXT_PUBLIC_COGNITO_CLIENT_ID
-   ENV NEXT_TELEMETRY_DISABLED=1
-   RUN npm run build
-   ```
-
-   **GitHub Actions** (or your local build command) — pass `build-args:` when invoking Buildx:
-   ```yaml
-   build-args: |
-     NEXT_PUBLIC_API_BASE_URL=https://api.mikeoss.com
-     NEXT_PUBLIC_AWS_REGION=us-east-1
-     NEXT_PUBLIC_COGNITO_USER_POOL_ID=${{ secrets.COGNITO_USER_POOL_ID }}
-     NEXT_PUBLIC_COGNITO_CLIENT_ID=${{ secrets.COGNITO_CLIENT_ID }}
-   ```
-
-   Publish to your own ECR or private GHCR namespace and replace the `image:` value in the task definition.
-
-2. **Accept the defaults baked in by the upstream build** — fine for an internal demo, broken for prod because the bundle will be hardcoded to `http://localhost:3001` for the API.
+**Frontend config is read at runtime — no rebuild needed.** The frontend serves its
+`NEXT_PUBLIC_*` values from a small dynamic route (`/runtime-env`) that reads
+`process.env` on each request and sets `window.__MIKE_ENV__` before the app hydrates
+(see `frontend/src/lib/runtimeConfig.ts`). So the published
+`ghcr.io/${GHCR_OWNER}/mike-frontend` image works as-is for any deployment — just set
+`NEXT_PUBLIC_API_BASE_URL`, `NEXT_PUBLIC_AWS_REGION`, `NEXT_PUBLIC_COGNITO_USER_POOL_ID`,
+and `NEXT_PUBLIC_COGNITO_CLIENT_ID` as task **environment** (already in the task
+definition above). There is no longer a build-time bake step, no per-deployment image,
+and no ECR mirror required for config reasons. (For `next dev`, the same values still
+come from `.env.local` as before.)
 
 ### Services
 
@@ -1212,7 +1187,7 @@ After launch:
 
 **The frontend hits `http://localhost:3001` in production.**
 
-- The image was built without overriding `NEXT_PUBLIC_API_BASE_URL`. Rebuild with the correct value baked in (see the Critical Next.js gotcha in §14).
+- `NEXT_PUBLIC_API_BASE_URL` isn't set on the frontend **task** (it's read at runtime via `/runtime-env`; see §14). Confirm it's in the task definition's `environment` and `curl https://${APP_FQDN}/runtime-env` returns it. Also check the `/runtime-env` request isn't blocked by a CDN/cache in front of the app.
 
 **Cognito signup confirmation email never arrives.**
 
@@ -1233,9 +1208,7 @@ After launch:
 
 These aren't required to ship, but most prod deployments end up here within a few months:
 
-**Re-build frontend image with prod `NEXT_PUBLIC_*` values.** Two changes are required (see the full diff in §14): (1) add `ARG`/`ENV` declarations for each `NEXT_PUBLIC_*` variable in `frontend/Dockerfile` before the `RUN npm run build` step — without these, `build-args` passed by Buildx are silently ignored and the defaults remain baked in; (2) pass the prod values via `build-args:` in your build workflow. Publish to your own ECR or private GHCR namespace and update the `image:` field in the task definition.
-
-**Mirror images to ECR.** Better pull latency, IAM-native auth (no Secrets Manager indirection), and lifecycle policies for tag cleanup. Add a job to `build-and-publish.yml` that re-tags the ghcr.io image into `${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/mike-{frontend,backend}` after the existing push.
+**Mirror images to ECR (optional).** The frontend reads `NEXT_PUBLIC_*` at runtime (§14), so no per-deployment image build is needed — the published GHCR images work as-is. ECR is therefore optional; mirror only if you want better pull latency, IAM-native auth (no Secrets Manager indirection), or lifecycle policies for tag cleanup. Add a job to `build-and-publish.yml` that re-tags the ghcr.io image into `${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/mike-{frontend,backend}` after the existing push.
 
 **WAFv2 in front of both ALBs.** Start with the AWS-managed Common rule set + a per-IP rate-based rule (the in-app limiter only kicks in after the request reaches a task — WAF cuts it earlier and cheaper). ~$5/month base + per-request.
 

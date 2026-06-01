@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, EB_Garamond } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 import { Providers } from "@/components/providers";
 
@@ -53,6 +54,9 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${inter.variable} ${ebGaramond.variable} font-sans antialiased`}>
+        {/* Inject runtime public config (window.__MIKE_ENV__) before hydration so
+            NEXT_PUBLIC_* can be set via environment variables, not baked at build. */}
+        <Script src="/runtime-env" strategy="beforeInteractive" />
         <Providers>{children}</Providers>
       </body>
     </html>

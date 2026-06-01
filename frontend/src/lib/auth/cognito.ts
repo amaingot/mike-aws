@@ -18,6 +18,7 @@ import {
   CognitoUserSession,
   type ICognitoUserPoolData,
 } from "amazon-cognito-identity-js";
+import { publicEnv } from "@/lib/runtimeConfig";
 
 interface PublicUser {
   id: string;
@@ -42,14 +43,14 @@ interface ApiResult<T> {
 // ---------------------------------------------------------------------------
 
 function poolConfig(): ICognitoUserPoolData {
-  const UserPoolId = process.env.NEXT_PUBLIC_COGNITO_USER_POOL_ID;
-  const ClientId = process.env.NEXT_PUBLIC_COGNITO_CLIENT_ID;
+  const UserPoolId = publicEnv("NEXT_PUBLIC_COGNITO_USER_POOL_ID");
+  const ClientId = publicEnv("NEXT_PUBLIC_COGNITO_CLIENT_ID");
   if (!UserPoolId || !ClientId) {
     throw new Error(
       "NEXT_PUBLIC_COGNITO_USER_POOL_ID and NEXT_PUBLIC_COGNITO_CLIENT_ID must be set",
     );
   }
-  const endpoint = process.env.NEXT_PUBLIC_COGNITO_ENDPOINT;
+  const endpoint = publicEnv("NEXT_PUBLIC_COGNITO_ENDPOINT");
   const config: ICognitoUserPoolData = { UserPoolId, ClientId };
   if (endpoint) {
     (config as ICognitoUserPoolData & { endpoint?: string }).endpoint = endpoint;
