@@ -3,7 +3,7 @@
 //
 // NEXT_PUBLIC_* values are normally inlined by `next build`, which forces an image
 // rebuild for every deployment (different API URL, Cognito pool, etc.). Instead the
-// server serves them from /__env at request time (see src/app/__env/route.ts),
+// server serves them from /runtime-env at request time (see src/app/runtime-env/route.ts),
 // which sets window.__MIKE_ENV__ before hydration; this module reads from there,
 // falling back to the build-time-inlined process.env so `next dev` and tests keep
 // working unchanged. One published image can then be configured entirely via
@@ -31,7 +31,7 @@ const BUILD_TIME: Record<PublicEnvKey, string | undefined> = {
 };
 
 export function publicEnv(key: PublicEnvKey): string | undefined {
-  // Server (including the /__env route handler): read live process.env at request
+  // Server (including the /runtime-env route handler): read live process.env at request
   // time — never inlined, always the container's runtime value.
   if (typeof window === "undefined") {
     const value = process.env[key];

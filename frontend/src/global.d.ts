@@ -1,6 +1,6 @@
 declare module "*.css";
 
-// Public runtime configuration injected by /__env (see src/lib/runtimeConfig.ts).
+// Public runtime configuration injected by /runtime-env (see src/lib/runtimeConfig.ts).
 interface MikePublicEnv {
   NEXT_PUBLIC_API_BASE_URL?: string;
   NEXT_PUBLIC_AWS_REGION?: string;
