@@ -24,11 +24,15 @@ const MAX_TOKENS = 16384;
 const ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31";
 
 // Maps public model IDs (what the frontend selects) to Bedrock model IDs.
-// Update at deploy time after verifying availability in the AWS Bedrock console.
+// These Claude models don't support direct on-demand foundation-model invocation
+// ("Retry with the ID or ARN of an inference profile"), so we target the US
+// cross-region inference profiles (us.*). Update at deploy time / per region:
+// `aws bedrock list-inference-profiles` and adjust the geo prefix (us./eu./apac.)
+// to match your deployment region.
 const BEDROCK_MODEL_IDS: Record<string, string> = {
-  "claude-opus-4-7": "anthropic.claude-opus-4-7-v1:0",
-  "claude-sonnet-4-6": "anthropic.claude-sonnet-4-6-v1:0",
-  "claude-haiku-4-5": "anthropic.claude-haiku-4-5-v1:0",
+  "claude-opus-4-7": "us.anthropic.claude-opus-4-7",
+  "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
+  "claude-haiku-4-5": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 };
 
 function resolveBedrockModelId(publicModel: string): string {
